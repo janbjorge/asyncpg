@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from .connection import connect, Connection  # NOQA
 from .exceptions import *  # NOQA
-from .pool import create_pool, Pool, AcquireEvent  # NOQA
+from .pool import create_pool, Pool  # NOQA
 from .protocol import Record  # NOQA
 from .types import *  # NOQA
 
@@ -19,6 +19,6 @@ from . import exceptions
 
 
 __all__: tuple[str, ...] = (
-    'connect', 'create_pool', 'Pool', 'Record', 'Connection', 'AcquireEvent'
+    'connect', 'create_pool', 'Pool', 'Record', 'Connection'
 )
 __all__ += exceptions.__all__ # NOQA

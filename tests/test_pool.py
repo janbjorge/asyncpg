@@ -1004,15 +1004,13 @@ class TestPool(tb.ConnectedTestCase):
         conn = await pool.acquire(timeout=0.1)
         await pool.release(conn)
 
-    async def test_pool_acquire_event_fires_when_saturated(self):
-        events = []
+    async def test_pool_on_acquire_reports_saturation_wait(self):
+        calls = []
         pool = await self.create_pool(
             database='postgres',
             min_size=1,
             max_size=1,
-            name='primary',
-            on_acquire_slow=events.append,
-            slow_acquire_threshold=0.05,
+            on_acquire=lambda p, w: calls.append((p, w)),
         )
         try:
             holder_acquired = asyncio.Event()
@@ -1037,76 +1035,20 @@ class TestPool(tb.ConnectedTestCase):
         finally:
             await pool.close()
 
-        slow = [e for e in events if e.wait_seconds >= 0.05]
-        self.assertEqual(len(slow), 1)
-        ev = slow[0]
-        self.assertEqual(ev.pool_name, 'primary')
-        self.assertEqual(ev.max_size, 1)
-        self.assertGreaterEqual(ev.wait_seconds, 0.05)
-        self.assertGreaterEqual(ev.size, 1)
-        self.assertGreaterEqual(ev.idle, 0)
+        self.assertEqual(len(calls), 2)
+        for p, w in calls:
+            self.assertIs(p, pool)
+            self.assertGreaterEqual(w, 0)
+        waits = sorted(w for _, w in calls)
+        self.assertGreaterEqual(waits[-1], 0.1)
 
-    async def test_pool_acquire_event_suppressed_under_threshold(self):
-        events = []
-        async with self.create_pool(
-                database='postgres',
-                min_size=2,
-                max_size=2,
-                on_acquire_slow=events.append,
-                slow_acquire_threshold=5.0) as pool:
-            async with pool.acquire() as con:
-                await con.fetchval('SELECT 1')
-
-        self.assertEqual(events, [])
-
-    async def test_pool_acquire_event_callback_exception_suppressed(self):
+    async def test_pool_on_acquire_not_fired_on_timeout(self):
         calls = []
-
-        def boom(event):
-            calls.append(event)
-            raise RuntimeError('callback failure')
-
         pool = await self.create_pool(
             database='postgres',
             min_size=1,
             max_size=1,
-            on_acquire_slow=boom,
-            slow_acquire_threshold=0.05,
-        )
-        try:
-            holder_acquired = asyncio.Event()
-            release_holder = asyncio.Event()
-
-            async def holder():
-                async with pool.acquire():
-                    holder_acquired.set()
-                    await release_holder.wait()
-
-            async def waiter():
-                await holder_acquired.wait()
-                async with pool.acquire() as con:
-                    self.assertEqual(await con.fetchval('SELECT 1'), 1)
-
-            holder_task = self.loop.create_task(holder())
-            waiter_task = self.loop.create_task(waiter())
-            await holder_acquired.wait()
-            await asyncio.sleep(0.15)
-            release_holder.set()
-            with self.assertLogs('asyncpg.pool', level='ERROR'):
-                await asyncio.gather(holder_task, waiter_task)
-        finally:
-            await pool.close()
-
-        self.assertEqual(len(calls), 1)
-
-    async def test_pool_acquire_event_not_fired_on_timeout(self):
-        events = []
-        pool = await self.create_pool(
-            database='postgres',
-            min_size=1,
-            max_size=1,
-            on_acquire_slow=events.append,
-            slow_acquire_threshold=0.01,
+            on_acquire=lambda p, w: calls.append(w),
         )
         try:
             async with pool.acquire():
@@ -1115,27 +1057,8 @@ class TestPool(tb.ConnectedTestCase):
         finally:
             await pool.close()
 
-        self.assertEqual(events, [])
-
-    async def test_pool_acquire_event_rejects_negative_threshold(self):
-        with self.assertRaisesRegex(
-                ValueError, 'slow_acquire_threshold'):
-            await self.create_pool(
-                database='postgres',
-                min_size=1,
-                max_size=1,
-                slow_acquire_threshold=-1.0,
-            )
-
-    async def test_pool_acquire_event_rejects_noncallable(self):
-        with self.assertRaisesRegex(
-                TypeError, 'on_acquire_slow'):
-            await self.create_pool(
-                database='postgres',
-                min_size=1,
-                max_size=1,
-                on_acquire_slow='not-callable',
-            )
+        # one event for the outer successful acquire, none for the timeout
+        self.assertEqual(len(calls), 1)
 
 
 @unittest.skipIf(os.environ.get('PGHOST'), 'unmanaged cluster')

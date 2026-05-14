@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-import dataclasses
 import functools
 import inspect
 import logging
@@ -24,20 +23,6 @@ from . import protocol
 
 
 logger = logging.getLogger(__name__)
-
-
-@dataclasses.dataclass(frozen=True)
-class AcquireEvent:
-    """Fired by :meth:`Pool.acquire` when wait exceeds the slow threshold.
-
-    .. versionadded:: 0.32.0
-    """
-
-    pool_name: Optional[str]
-    wait_seconds: float
-    size: int
-    idle: int
-    max_size: int
 
 
 class PoolConnectionProxyMeta(type):
@@ -358,7 +343,7 @@ class Pool:
         '_holders', '_initialized', '_initializing', '_closing',
         '_closed', '_connection_class', '_record_class', '_generation',
         '_setup', '_max_queries', '_max_inactive_connection_lifetime',
-        '_name', '_on_acquire_slow', '_slow_acquire_threshold',
+        '_on_acquire',
     )
 
     def __init__(self, *connect_args,
@@ -373,10 +358,8 @@ class Pool:
                  loop,
                  connection_class,
                  record_class,
-                 name: Optional[str] = None,
-                 on_acquire_slow: Optional[
-                     Callable[[AcquireEvent], None]] = None,
-                 slow_acquire_threshold: float = 0.1,
+                 on_acquire: Optional[
+                     Callable[["Pool", float], None]] = None,
                  **connect_kwargs):
 
         if len(connect_args) > 1:
@@ -419,17 +402,7 @@ class Pool:
                 'record_class is expected to be a subclass of '
                 'asyncpg.Record, got {!r}'.format(record_class))
 
-        if slow_acquire_threshold < 0:
-            raise ValueError(
-                'slow_acquire_threshold is expected to be greater '
-                'or equal to zero')
-
-        if on_acquire_slow is not None and not callable(on_acquire_slow):
-            raise TypeError('on_acquire_slow must be callable or None')
-
-        self._name = name
-        self._on_acquire_slow = on_acquire_slow
-        self._slow_acquire_threshold = slow_acquire_threshold
+        self._on_acquire = on_acquire
 
         self._minsize = min_size
         self._maxsize = max_size
@@ -924,31 +897,23 @@ class Pool:
             raise exceptions.InterfaceError('pool is closing')
         self._check_init()
 
+        cb = self._on_acquire
+        if cb is None:
+            if timeout is None:
+                return await _acquire_impl()
+            return await compat.wait_for(_acquire_impl(), timeout=timeout)
+
         started = time.monotonic()
         if timeout is None:
             proxy = await _acquire_impl()
         else:
-            proxy = await compat.wait_for(
-                _acquire_impl(), timeout=timeout)
-        self._maybe_emit_acquire_event(time.monotonic() - started)
-        return proxy
-
-    def _maybe_emit_acquire_event(self, wait_seconds: float) -> None:
-        cb = self._on_acquire_slow
-        if cb is None or wait_seconds < self._slow_acquire_threshold:
-            return
-        event = AcquireEvent(
-            pool_name=self._name,
-            wait_seconds=wait_seconds,
-            size=self.get_size(),
-            idle=self.get_idle_size(),
-            max_size=self._maxsize,
-        )
+            proxy = await compat.wait_for(_acquire_impl(), timeout=timeout)
         try:
-            cb(event)
+            cb(self, time.monotonic() - started)
         except Exception:
             logger.exception(
-                'asyncpg on_acquire_slow callback raised; suppressing')
+                'asyncpg on_acquire callback raised; suppressing')
+        return proxy
 
     async def release(self, connection, *, timeout=None):
         """Release a database connection back to the pool.
@@ -1136,10 +1101,8 @@ def create_pool(dsn=None, *,
                 loop=None,
                 connection_class=connection.Connection,
                 record_class=protocol.Record,
-                name: Optional[str] = None,
-                on_acquire_slow: Optional[
-                    Callable[[AcquireEvent], None]] = None,
-                slow_acquire_threshold: float = 0.1,
+                on_acquire: Optional[
+                    Callable[["Pool", float], None]] = None,
                 **connect_kwargs):
     r"""Create a connection pool.
 
@@ -1287,22 +1250,15 @@ def create_pool(dsn=None, *,
     .. versionchanged:: 0.30.0
        Added the *connect* and *reset* parameters.
 
-    :param str name:
-        Optional identifier exposed on :class:`AcquireEvent` as
-        ``pool_name``.
-
-    :param on_acquire_slow:
-        Synchronous callback invoked with an :class:`AcquireEvent` when
-        :meth:`Pool.acquire` waits at least *slow_acquire_threshold*
-        seconds before dispatching a connection.  Only fires on
-        successful dispatch.  Exceptions are logged and suppressed.
-
-    :param float slow_acquire_threshold:
-        Threshold in seconds for *on_acquire_slow*.  Defaults to ``0.1``.
+    :param on_acquire:
+        Synchronous callback invoked as ``on_acquire(pool, wait_seconds)``
+        after every successful :meth:`Pool.acquire` dispatch.
+        ``wait_seconds`` is wall-clock time spent inside
+        :meth:`Pool.acquire` (queue wait plus any reconnect or
+        ``setup`` callback).  Exceptions are logged and suppressed.
 
     .. versionchanged:: 0.32.0
-       Added the *name*, *on_acquire_slow* and *slow_acquire_threshold*
-       parameters.
+       Added the *on_acquire* parameter.
     """
     return Pool(
         dsn,
@@ -1317,8 +1273,6 @@ def create_pool(dsn=None, *,
         init=init,
         reset=reset,
         max_inactive_connection_lifetime=max_inactive_connection_lifetime,
-        name=name,
-        on_acquire_slow=on_acquire_slow,
-        slow_acquire_threshold=slow_acquire_threshold,
+        on_acquire=on_acquire,
         **connect_kwargs,
     )
